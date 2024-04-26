@@ -9,6 +9,8 @@ from pytorch_lightning.metrics import MetricCollection
 from pytorch_lightning.utilities import move_data_to_device
 from ..nn.utils.metric_base import MaskedMetric
 
+from ..nn.models.brits_classifier import BRITSCLASSIFIER
+
 from .. import epsilon
 from .. utils.utils import ensure_list
 
@@ -146,7 +148,7 @@ class Classifier(pl.LightningModule):
             return y, y_predict, mask
         return y_predict
 
-    def predict_loader(self, loader, preprocess=False, return_mask=True):
+    def predict_loader(self, loader, preprocess=False):
         """
         Makes predictions for an input dataloader. Returns both the predictions and predictions targets.
 
@@ -156,26 +158,46 @@ class Classifier(pl.LightningModule):
         :return: y_ture, y_predict
         """
 
-        targets, predicts, masks = [], [] ,[]
+        targets, predicts, repres = [], [] ,[]
         for batch in loader:
             batch = move_data_to_device(batch, self.device)
             batch_data, batch_preprocessing = self._unpack_batch(batch)
             # Extract mask and target
             # eval_mask = batch_data.pop('eval_mask', None)
             y = batch_data.pop('y')
+
+            # Others
             y = y[:, 0, -1, :]
             y = torch.squeeze(y)
 
-            y_predict = self.predict_batch(batch, preprocess=preprocess)
+            # predictions, y_predict, y_repre = self.predict_batch(batch, preprocess=preprocess)
+            # if isinstance(y_predict, (list, tuple)):
+            #     y_predict = y_predict[0]
+            # # y_repre = torch.softmax(y_repre, dim=1)
+            # predicts.append(y_predict)
+            # repres.append(y_repre)
+            # masks.append(eval_mask)
+
+            # BRITS
+            if isinstance(self.model, BRITSCLASSIFIER):
+                # y = y[:, 0, -1]
+                # y = torch.squeeze(y)
+                predictions, y_repre = self.predict_batch(batch, preprocess=preprocess)
+                repres.append(y_repre)
+            else:
+                predictions, y_predict, y_repre = self.predict_batch(batch, preprocess=preprocess)
+                if isinstance(y_predict, (list, tuple)):
+                    y_predict = y_predict[0]
+                # # y_repre = torch.softmax(y_repre, dim=1)
+                predicts.append(y_predict)
+                repres.append(y_repre)
 
             target = y.type(torch.LongTensor).cuda()
-
-            if isinstance(y_predict, (list, tuple)):
-                y_predict = y_predict[0]
-
-            targets.append(y)
-            predicts.append(y_predict)
-            masks.append(eval_mask)
+            targets.append(target)
+        print("Predicted loader")
+        y = torch.cat(targets, 0)
+        y_pre = torch.cat(repres, 0)
+        return y, y_pre
 
     def _unpack_batch(self, batch):
         """
