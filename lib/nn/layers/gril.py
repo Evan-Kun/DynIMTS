@@ -1243,6 +1243,7 @@ class EncoderDecoder(nn.Module):
 class ClassifierEncoder(nn.Module):
     def __init__(self,
                  input_size,
+                 model_size,
                  hidden_size,
                  u_size=None,
                  n_layers=1,
@@ -1253,14 +1254,18 @@ class ClassifierEncoder(nn.Module):
                  support_len=2,
                  n_nodes=None,
                  layer_norm=False,
+                 embedding_size=0,
                  n_class=2):
         super(ClassifierEncoder, self).__init__()
         self.input_size = int(input_size)
+        self.model_size = int(model_size)
         self.hidden_size = int(hidden_size)
         self.u_size = int(u_size) if u_size is not None else 0
         self.n_layers = int(n_layers)
-        rnn_input_size = 2 * self.input_size + self.u_size  # input + mask + (eventually) exogenous
-
+        # rnn_input_size = self.hidden_size + self.u_size  # input + mask + (eventually) exogenous
+        # rnn consider x  = [x, h]
+        rnn_input_size = self.input_size + 1 + self.u_size  # input + mask + (eventually) exogenous
+        
         # Spatio-temporal encoder (rnn_input_size -> hidden_size)
         self.cells = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -1269,17 +1274,29 @@ class ClassifierEncoder(nn.Module):
                                         num_units=self.hidden_size, support_len=support_len, order=kernel_size))
             if layer_norm:
                 self.norms.append(nn.GroupNorm(num_groups=1, num_channels=self.hidden_size))
+                # self.norms.append(nn.BatchNorm1d(self.hidden_size))
+                # self.norms.append(nn.LayerNorm())
             else:
                 self.norms.append(nn.Identity())
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
-
-        # Spatial decoder (rnn_input_size + hidden_size -> hidden_size)
-        self.spatial_decoder = SpatialDecoder(d_in=rnn_input_size + self.hidden_size,
-                                              d_model=self.hidden_size,
+ 
+        # Spatial encoder (rnn_input_size + hidden_size -> hidden_size)
+        # self.spatial_encoder = SpatialEncoder(d_in=2 * self.input_size,
+        #                                       d_model=self.hidden_size,
+        #                                       d_out=self.hidden_size,
+        #                                       support_len=1,
+        #                                       order=decoder_order,
+        #                                       attention_block=global_att,
+        #                                       dropout=dropout)
+        # consider x = [x, h]
+        self.spatial_encoder = SpatialEncoder(d_in=2 * self.input_size + self.hidden_size,
+                                              d_hidden = self.hidden_size,
+                                              d_model=self.model_size,
                                               d_out=self.input_size,
-                                              support_len=2,
+                                              support_len=1,
                                               order=decoder_order,
-                                              attention_block=global_att)
+                                              attention_block=global_att,
+                                              dropout=dropout)
 
         # Hidden state initialization embedding
         if n_nodes is not None:
@@ -1287,9 +1304,16 @@ class ClassifierEncoder(nn.Module):
         else:
             self.register_parameter('h0', None)
 
+        if embedding_size > 0:
+            self.emb = nn.Parameter(torch.empty(embedding_size, n_nodes))
+            nn.init.kaiming_normal_(self.emb, nonlinearity='relu')
+        else:
+            self.register_parameter('emb', None)
+
+
         # learn a adj A
-        # self.activation = nn.Sigmoid()
-        self.activation = nn.LeakyReLU()
+        self.activation = nn.Sigmoid()
+        # self.activation = nn.LeakyReLU()
         # self.activation = nn.ReLU()
         self.transformA = nn.Linear(n_nodes, n_nodes, bias=True)
         self.attention = nn.MultiheadAttention(n_nodes, 1)
@@ -1298,26 +1322,60 @@ class ClassifierEncoder(nn.Module):
         self.n_class = n_class
         # self.classifier = nn.Sequential(
         #     nn.Linear(n_nodes * self.hidden_size, 300),
-        #     nn.ReLU(),
+        #     nn.LeakyReLU(),
         #     nn.Linear(300, 300),
-        #     nn.ReLU(),
+        #     nn.LeakyReLU(),
         #     nn.Linear(300, self.n_class)
         # )
+
+        self._classfy_from_states = True
+
         self.classifier = nn.Sequential(
-            nn.Linear(n_nodes * self.hidden_size, n_nodes * self.hidden_size),
+            # nn.BatchNorm1d(n_nodes * self.hidden_size),
+            nn.Linear(in_features= n_nodes * (self.hidden_size + embedding_size),
+                      out_features=n_nodes * (self.hidden_size + embedding_size)),
+            nn.Dropout(dropout),
             nn.ReLU(),
-            nn.Linear(n_nodes * self.hidden_size, self.n_class)
+            # nn.BatchNorm1d(n_nodes * self.hidden_size),
+            nn.Linear(n_nodes * (self.hidden_size + embedding_size), self.n_class)
         )
 
+        self.classifier_repre = nn.Sequential(
+            # nn.BatchNorm1d(n_nodes * self.hidden_size * 2),
+            # nn.Linear(n_nodes * ((self.hidden_size) + embedding_size),
+            #           n_nodes * ((self.hidden_size) + embedding_size)),
+            nn.Linear(n_nodes * (self.hidden_size + self.model_size + embedding_size),
+                      n_nodes * (self.hidden_size + self.model_size + embedding_size)),
+            nn.Dropout(dropout),
+            nn.ReLU(),
+            # nn.BatchNorm1d(n_nodes * self.hidden_size),
+            nn.Linear(n_nodes * (self.hidden_size + self.model_size + embedding_size), self.n_class)
+            # nn.Linear(n_nodes * ((self.hidden_size) + embedding_size), self.n_class)
+        )
 
+        # nn.init.xavier_normal_(self.transformA.weight)
+        nn.init.xavier_uniform_(self.transformA.weight)
+
+        for layer in self.classifier:
+            if isinstance(layer, nn.Linear):
+                # nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+                # nn.init.xavier_normal_(layer.weight)
+                nn.init.xavier_uniform_(layer.weight)
+
+        for layer in self.classifier_repre:
+            if isinstance(layer, nn.Linear):
+                # nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+                # nn.init.xavier_normal_(layer.weight)
+                nn.init.xavier_uniform_(layer.weight)
 
     def init_hidden_states(self, n_nodes):
         h0 = []
         for l in range(self.n_layers):
             std = 1. / torch.sqrt(torch.tensor(self.hidden_size, dtype=torch.float))
             vals = torch.distributions.Normal(0, std).sample((self.hidden_size, n_nodes))
-            xavier_norm = torch.nn.init.xavier_normal(torch.empty(self.hidden_size, n_nodes))
-            kaiming_norm = torch.nn.init.kaiming_normal_(torch.empty(self.hidden_size, n_nodes), mode='fan_out')
+            # vals = torch.zeros(self.hidden_size, n_nodes)
+            # xavier_norm = torch.nn.init.xavier_normal(torch.empty(self.hidden_size, n_nodes))
+            # kaiming_norm = torch.nn.init.kaiming_normal_(torch.empty(self.hidden_size, n_nodes), mode='fan_out')
             h0.append(nn.Parameter(vals))
             # h0.append(nn.Parameter(kaiming_norm))
         return nn.ParameterList(h0)
@@ -1355,9 +1413,13 @@ class ClassifierEncoder(nn.Module):
         elif not isinstance(h, list):
             h = [*h]
 
+        # torch.set_printoptions(profile="full", linewidth=300)
+        # print(h)
+
         # Temporal conv
         predictions, imputations, states = [], [], []
         representations = []
+        learned_adjs = []
         for step in range(steps):
             x_s = x[..., step]
             m_s = mask[..., step]
@@ -1365,105 +1427,273 @@ class ClassifierEncoder(nn.Module):
             u_s = u[..., step] if u is not None else None
             diag = 1 - torch.eye(x_s.shape[2]).to(x.device)
             attention_adj = False
-            if(step != 0):
-                if (attention_adj==True):
+            adj_threshold = 0.1
+            if torch.isnan(x_s).any():
+                # Create a Boolean mask for infinite values
+                x_s_mask = torch.isnan(x_s)
 
-                    # attention
-                    h_s_t = h_s.permute((2, 0, 1))
-                    attn_output1, attn_output_weights1 = self.adj_attention(h_s_t, h_s_t, h_s_t)
-                    adj_h_n = attn_output_weights1
+                # Use the mask to extract the positions of infinite values
+                nan_indices = torch.where(x_s_mask)[0]
 
-                    # adj_h_n_sum = torch.sum(adj_h_n, 1)
-                    # adj_h_n = adj_h_n / adj_h_n_sum
-                    # attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention, adj_h_n_attention)
-                    # adj_h_n_dia = adj_h_n.diagonal(dim1=1, dim2=2)
-                    # adj_h_n_dia_unsq = torch.unsqueeze(adj_h_n_dia, dim=2)
-                    # adj_h_n_dia_exp = adj_h_n_dia.expand(-1, -1, 36)
-                    # adj_h_n_norm = adj_h_n / adj_h_n_dia_unsq
-                    # adj_h_n_attention = adj_h_n_norm.permute((1, 0, 2))
-                    adj_h_n_attention = adj_h_n.permute((1, 0, 2))
-                    attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention, adj_h_n_attention)
+                # Print the indices of infinite values
+                print(nan_indices)
+            # else:
+            #     print("The adj_h_n tensor does not contain any infinite values.")
 
-                    adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n)
-                    # adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n_norm)
-                    adj_attention_mean = torch.mean(adj_attention, 0)
-                    adj_h_n = adj_attention_mean
-                    # print('\n--------------------Attention Mean A-----------------------')
-                    # print(adj_attention_mean)
-                    # print('\n-----------------------------------------------------------')
+            # assert torch.isnan(x_s).any()
+            # assert torch.isnan(h_s).any()
 
-                    # print('\n------------------------cosine A---------------------------')
-                    # print(adj_h_n)
-                    # print('\n-----------------------------------------------------------')
-                    adj_std, adj_mean = torch.std_mean(adj_h_n)
-                    adj_h_n_ms = torch.exp(-torch.square((adj_h_n - adj_mean) / (adj_std + 0.000001)))
-                    adj_mlp = self.transformA(adj_h_n_ms)
-                    adj_act = self.activation(adj_mlp)
+            # if(step != 0):
+            #     if (attention_adj==True):
+            #
+            #         # attention
+            #         h_s_t = h_s.permute((2, 0, 1))
+            #         attn_output1, attn_output_weights1 = self.adj_attention(h_s_t, h_s_t, h_s_t)
+            #         adj_h_n = attn_output_weights1
+            #
+            #         # adj_h_n_sum = torch.sum(adj_h_n, 1)
+            #         # adj_h_n = adj_h_n / adj_h_n_sum
+            #         # attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention, adj_h_n_attention)
+            #         # adj_h_n_dia = adj_h_n.diagonal(dim1=1, dim2=2)
+            #         # adj_h_n_dia_unsq = torch.unsqueeze(adj_h_n_dia, dim=2)
+            #         # adj_h_n_dia_exp = adj_h_n_dia.expand(-1, -1, 36)
+            #         # adj_h_n_norm = adj_h_n / adj_h_n_dia_unsq
+            #         # adj_h_n_attention = adj_h_n_norm.permute((1, 0, 2))
+            #         adj_h_n_attention = adj_h_n.permute((1, 0, 2))
+            #         attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention, adj_h_n_attention)
+            #
+            #         adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n)
+            #         # adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n_norm)
+            #         adj_attention_mean = torch.mean(adj_attention, 0)
+            #         adj_h_n = adj_attention_mean
+            #         # print('\n--------------------Attention Mean A-----------------------')
+            #         # print(adj_attention_mean)
+            #         # print('\n-----------------------------------------------------------')
+            #
+            #         # print('\n------------------------cosine A---------------------------')
+            #         # print(adj_h_n)
+            #         # print('\n-----------------------------------------------------------')
+            #         adj_std, adj_mean = torch.std_mean(adj_h_n)
+            #         adj_h_n_ms = torch.exp(-torch.square((adj_h_n - adj_mean) / (adj_std + 0.000001)))
+            #         adj_mlp = self.transformA(adj_h_n_ms)
+            #         adj_act = self.activation(adj_mlp)
+            #
+            #         # normalisation
+            #         adj_act_std, adj_act_mean = torch.std_mean(adj_act)
+            #         adj_act_ms = torch.exp(-torch.square((adj_act - adj_act_mean) / adj_act_std))
+            #         adj_act_ms = adj_act_ms * diag
+            #         adj_mask = adj_act_ms > 0.1
+            #         adj_mask = adj_mask.long()
+            #         adj_act_ms = adj_act_ms * adj_mask
+            #
+            #         adj_sum = torch.sum(adj_act_ms, 1)
+            #         # adj_sum = adj_sum.expand(h_s.shape[0], h_s.shape[2], h_s.shape[2])
+            #         adj_result = adj_act_ms / (adj_sum + 0.000001)
+            #         adj = [adj_result, adj_result]
+            #         learned_adj = adj
+            #     else:
+            #         h_s_t = h_s.permute((0, 2, 1))
+            #         h_s_t_n = h_s_t / (torch.norm(h_s_t, dim=(2), keepdim=True).expand(-1, -1, h_s_t.shape[2]) + 0.000001)
+            #         h_s_n = h_s / (torch.norm(h_s, dim=(1), keepdim=True).expand(-1, h_s.shape[1], h_s.shape[2]) + 0.000001)
+            #         adj_h_n = torch.bmm(h_s_t_n, h_s_n)
+            #         if (adj_h_n.dim() > 3):
+            #             adj_h_n = torch.squeeze(adj_h_n)
+            #         # print('-------------cosine A----------------')
+            #         adj_h_n_attention = adj_h_n.permute((1, 0, 2))
+            #         attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention,
+            #                                                           adj_h_n_attention)
+            #
+            #         adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n)
+            #         # adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n_norm)
+            #
+            #         # assert torch.isnan(adj_h_n).any()
+            #
+            #
+            #         has_inf = torch.isinf(adj_h_n).any()
+            #
+            #         if has_inf:
+            #             # Create a Boolean mask for infinite values
+            #             mask = torch.isinf(adj_h_n)
+            #
+            #             # Use the mask to extract the positions of infinite values
+            #             inf_indices = torch.where(mask)[0]
+            #
+            #             # Print the indices of infinite values
+            #             print(inf_indices)
+            #         # else:
+            #         #     print("The adj_h_n tensor does not contain any infinite values.")
+            #         # print('h_s_t------------------------')
+            #         # print(h_s_t)
+            #         # print('h_s_t_n------------------------')
+            #         # print(h_s_t_n)
+            #         # print('h_s_n------------------------')
+            #         # print(h_s_n)
+            #         # print('------------------------')
+            #         # print(adj_h_n)
+            #         # print(torch.isinf(adj_h_n).any())
+            #         # assert torch.isinf(adj_h_n).any()
+            #         # assert torch.isinf(adj_attention).any()
+            #
+            #
+            #         adj_attention_mean = torch.mean(adj_attention, dim=0)
+            #         adj_h_n = adj_attention_mean
+            #         # print('-------------attention A----------------')
+            #         adj_std, adj_mean = torch.std_mean(adj_h_n)
+            #         adj_h_n_ms = torch.exp(-torch.square((adj_h_n - adj_mean) / (adj_std + 0.000001)))
+            #         adj_mlp = self.transformA(adj_h_n_ms)
+            #         adj_act = self.activation(adj_mlp)
+            #
+            #         # normalisation
+            #         # print('-------------MLP A----------------')
+            #         adj_act_std, adj_act_mean = torch.std_mean(adj_act)
+            #         adj_act_ms = torch.exp(-torch.square((adj_act - adj_act_mean) / (adj_act_std + 0.000001)))
+            #         adj_act_ms = adj_act_ms * diag
+            #         adj_mask = adj_act_ms > 0.1
+            #
+            #         adj_mask = adj_mask.long()
+            #         adj_act_ms = adj_act_ms * adj_mask
+            #         # print('-------------normlasization A----------------')
+            #         adj_sum = torch.sum(adj_act_ms, 1)
+            #         # adj_sum = adj_sum.expand(h_s.shape[0], h_s.shape[2], h_s.shape[2])
+            #         adj_result = adj_act_ms / (adj_sum + 0.000001)
+            #         adj = [adj_result, adj_result]
+            #         learned_adj = adj
+            # else:
+            #     adj_sum = torch.sum(adj[0], 1)
+            #     adj_result = adj[0] / (adj_sum + 0.000001)
+            #     adj = [adj_result, adj_result]
 
-                    # normalisation
-                    adj_act_std, adj_act_mean = torch.std_mean(adj_act)
-                    adj_act_ms = torch.exp(-torch.square((adj_act - adj_act_mean) / adj_act_std))
-                    adj_act_ms = adj_act_ms * diag
-                    adj_mask = adj_act_ms > 0.1
-                    adj_mask = adj_mask.long()
-                    adj_act_ms = adj_act_ms * adj_mask
+            h_s_t = h_s.permute((0, 2, 1))
+            h_s_t_n = h_s_t / (torch.norm(h_s_t, dim=(2), keepdim=True).expand(-1, -1, h_s_t.shape[2]) + 0.000001)
+            h_s_n = h_s / (torch.norm(h_s, dim=(1), keepdim=True).expand(-1, h_s.shape[1], h_s.shape[2]) + 0.000001)
+            adj_h_n = torch.bmm(h_s_t_n, h_s_n)
+            if (adj_h_n.dim() > 3):
+                adj_h_n = torch.squeeze(adj_h_n)
+            # print('-------------cosine A----------------')
 
-                    adj_sum = torch.sum(adj_act_ms, 1)
-                    # adj_sum = adj_sum.expand(h_s.shape[0], h_s.shape[2], h_s.shape[2])
-                    adj_result = adj_act_ms / (adj_sum + 0.000001)
-                    adj = [adj_result, adj_result]
-                    learned_adj = adj
-                else:
-                    h_s_t = h_s.permute((0, 2, 1))
-                    h_s_t_n = h_s_t / (torch.norm(h_s_t, dim=(2), keepdim=True).expand(-1, -1, h_s_t.shape[2]) + 0.000001)
-                    h_s_n = h_s / (torch.norm(h_s, dim=(1), keepdim=True).expand(-1, h_s.shape[1], h_s.shape[2]) + 0.000001)
-                    adj_h_n = torch.bmm(h_s_t_n, h_s_n)
-                    if (adj_h_n.dim() > 3):
-                        adj_h_n = torch.squeeze(adj_h_n)
-                    # print('-------------cosine A----------------')
-                    adj_h_n_attention = adj_h_n.permute((1, 0, 2))
-                    attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention,
-                                                                      adj_h_n_attention)
+            # remove attention 
+            adj_h_n_attention = adj_h_n.permute((1, 0, 2))
+            attn_output, attn_output_weights = self.attention(adj_h_n_attention, adj_h_n_attention,
+                                                              adj_h_n_attention)
 
-                    adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n)
-                    # adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n_norm)
-                    adj_attention_mean = torch.mean(adj_attention, 0)
-                    adj_h_n = adj_attention_mean
-                    # print('-------------attention A----------------')
-                    adj_std, adj_mean = torch.std_mean(adj_h_n)
-                    adj_h_n_ms = torch.exp(-torch.square((adj_h_n - adj_mean) / (adj_std + 0.000001)))
-                    adj_mlp = self.transformA(adj_h_n_ms)
-                    adj_act = self.activation(adj_mlp)
-
-                    # normalisation
-                    # print('-------------MLP A----------------')
-                    adj_act_std, adj_act_mean = torch.std_mean(adj_act)
-                    adj_act_ms = torch.exp(-torch.square((adj_act - adj_act_mean) / (adj_act_std + 0.000001)))
-                    adj_act_ms = adj_act_ms * diag
-                    adj_mask = adj_act_ms > 0.1
-
-                    adj_mask = adj_mask.long()
-                    adj_act_ms = adj_act_ms * adj_mask
-                    # print('-------------normlasization A----------------')
-                    adj_sum = torch.sum(adj_act_ms, 1)
-                    # adj_sum = adj_sum.expand(h_s.shape[0], h_s.shape[2], h_s.shape[2])
-                    adj_result = adj_act_ms / (adj_sum + 0.000001)
-                    adj = [adj_result, adj_result]
-                    learned_adj = adj
+            adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n)
 
 
+            # adj_attention = torch.einsum('ncw,nwv->ncv', attn_output_weights, adj_h_n_norm)
+            # assert torch.isnan(adj_h_n).any()
+            # has_inf = torch.isinf(adj_h_n).any()
+            # if has_inf:
+            #     # Create a Boolean mask for infinite values
+            #     mask = torch.isinf(adj_h_n)
+
+            #     # Use the mask to extract the positions of infinite values
+            #     inf_indices = torch.where(mask)[0]
+
+            #     # Print the indices of infinite values
+            #     print(inf_indices)
+            # else:
+            #     print("The adj_h_n tensor does not contain any infinite values.")
+            # print('h_s_t------------------------')
+            # print(h_s_t)
+            # print('h_s_t_n------------------------')
+            # print(h_s_t_n)
+            # print('h_s_n------------------------')
+            # print(h_s_n)
+            # print('------------------------')
+            # print(adj_h_n)
+            # print(torch.isinf(adj_h_n).any())
+            # assert torch.isinf(adj_h_n).any()
+            # assert torch.isinf(adj_attention).any()
+
+
+            # remove attention 
+            adj_attention_mean = torch.mean(adj_attention, dim=0)
+            adj_h_n = adj_attention_mean
+            # print('-------------attention A----------------')
+
+            # calculate mean
+            # adj_h_n = torch.mean(adj_h_n, dim=0)
+
+            # standarlisation
+            # adj_std, adj_mean = torch.std_mean(adj_h_n)
+            # adj_h_n_ms = torch.exp(-torch.square((adj_h_n - adj_mean) / (adj_std + 0.000001)))
+  
+            # nomalisation
+            adj_h_n_ms = (adj_h_n - adj_h_n.min()) /  (adj_h_n.max() - adj_h_n.min() + 0.000001 )
+
+            # Remove mlp part
+
+            adj_mlp = self.transformA(adj_h_n_ms)
+            adj_act = self.activation(adj_mlp)
+            # adj_act = adj_h_n_ms
+
+            # normalisation
+            # print('-------------MLP A----------------')
+
+            # standarlisation
+            # adj_act_std, adj_act_mean = torch.std_mean(adj_act)
+            # adj_act_ms = torch.exp(-torch.square((adj_act - adj_act_mean) / (adj_act_std + 0.000001)))
+
+            # nomalisation
+            adj_act_ms = (adj_act - adj_act.min()) / \
+                (adj_act.max() - adj_act.min() + 0.000001)
+
+            adj_act_ms = adj_act_ms * diag
+            adj_mask = adj_act_ms > adj_threshold
+
+            adj_mask = adj_mask.long()
+            adj_act_ms = adj_act_ms * adj_mask
+            # print('-------------normlasization A----------------')
+            adj_sum = torch.sum(adj_act_ms, 1)
+            # adj_sum = adj_sum.expand(h_s.shape[0], h_s.shape[2], h_s.shape[2])
+            adj_result = adj_act_ms / (adj_sum + 0.000001)
+            adj = [adj_result, adj_result]
+            learned_adj = adj_act_ms
+            learned_adjs.append(learned_adj)
+
+            # imputation
             # retrieve maximum information from neighbors
-            xs_hat, repr_s = self.spatial_decoder(x=x_s, m=m_s, h=h_s, u=u_s, adj=adj,
-                                                    cached_support=cached_support)  # receive messages from neighbors (no self-loop!)
-            # readout of imputation state + mask to retrieve imputations
+            # xs_hat, repr_s = self.spatial_encoder(x=x_s, m=m_s, h=h_s, u=u_s, adj=[adj_act_ms],
+            #                                                                       cached_support=cached_support)
+            xs_hat, repr_s = self.spatial_encoder(x=x_s, m=m_s, h=h_s, u=u_s, adj=[adj_result],
+                                                                                  cached_support=cached_support)
             # prepare inputs
             x_s = torch.where(m_s, x_s, xs_hat)
             inputs = [x_s, m_s]
+            
+            # # retrieve maximum information from neighbors
+            # # repr_s = self.spatial_encoder(x=x_s, m=m_s, h=h_s, u=u_s, adj=[
+            # #                               adj_result], cached_support=cached_support)
+            # repr_s = self.spatial_encoder(x=x_s, m=m_s, h=h_s, u=u_s, adj=[adj_act_ms],
+            #                                         cached_support=cached_support)  
+            # # receive messages from neighbors (no self-loop!)
+            # # readout of imputation state + mask to retrieve imputations
+            # # prepare inputs
+
+            # inputs = [repr_s]
             if u_s is not None:
                 inputs.append(u_s)
             inputs = torch.cat(inputs, dim=1)  # x_hat_2 + mask + exogenous
             # update state with original sequence filled using imputations
-            h = self.update_state(inputs, h, adj)
+
+            # print('inputs------------------')
+            # print('inputs------------------')
+            # print('inputs------------------')
+            # print('inputs------------------')
+            # print('inputs------------------')
+            # print(inputs)
+            # print('h------------------')
+            # print('h------------------')
+            # print('h------------------')
+            # print('h------------------')
+            # print(h)
+
+            h = self.update_state(inputs, h, [adj_result])
+            # h = self.update_state(inputs, h, [adj_act_ms])
+            # print(h)
+
+            # assert torch.isnan(h).any()
+
             # store imputations and states
             states.append(torch.stack(h, dim=0))
             representations.append(repr_s)
@@ -1472,13 +1702,86 @@ class ClassifierEncoder(nn.Module):
                 # print('learned graph: ')
                 # print(adj_act_ms)
                 h_enc = h[-1]
+                repre_enc = repr_s
 
         # Aggregate outputs -> [batch, features, nodes, steps]
         states = torch.stack(states, dim=-1)
         representations = torch.stack(representations, dim=-1)
-        h_final = h_enc.reshape(h_enc.shape[0], -1)
-        output = self.classifier(h_final)
+        # flat hidden_states and representation
+        # h_final = h_enc.reshape(h_enc.shape[0], -1)
+        # repre_finnal = repre_enc.reshape(repre_enc.shape[0], -1)
+
+        if self._classfy_from_states:
+            if self.emb is not None:
+                b, *_, = h_enc.shape
+                repre_emb = self.emb.view(1, *self.emb.shape).expand(b, -1, -1)
+                h_final = torch.cat((h_enc, repre_emb), dim=1)
+                repre_final = torch.cat((repre_enc, repre_emb), dim=1)
+            output = self.classifier(h_final.reshape(h_final.shape[0], -1))
+            output_repre = self.classifier_repre(repre_final.reshape(repre_final.shape[0], -1))
+        else:
+            h_final = h_enc.reshape(h_enc.shape[0], -1)
+            repre_final = repre_enc.reshape(repre_enc.shape[0], -1)
+            output = self.classifier(h_final)
+            output_repre = self.classifier_repre(repre_final)
         # representations_output = self.classifier(representations)
+        # add new classifyer to classify
+        # return representations, states, learned_adjs, h_enc, output, output_repre
 
-        return representations, states, learned_adj, h_enc, output
+        return representations, states, learned_adjs, h_enc, output_repre, output
 
+
+class SpatialEncoder(nn.Module):
+    def __init__(self, d_in, d_hidden, d_model, d_out, support_len, order=1, attention_block=False, nheads=2, dropout=0.):
+        super(SpatialEncoder, self).__init__()
+        self.order = order
+        self.lin_in = nn.Conv1d(d_in, d_model, kernel_size=1)
+        self.graph_conv = SpatialConvOrderK(c_in=d_model, c_out=d_model,
+                                            support_len=support_len * order, order=1, include_self=False)
+        if attention_block:
+            self.spatial_att = SpatialAttention(d_in=d_model,
+                                                d_model=d_model,
+                                                nheads=nheads,
+                                                dropout=dropout)
+            self.lin_out = nn.Conv1d(3 * d_model, d_model, kernel_size=1)
+        else:
+            self.register_parameter('spatial_att', None)
+            # self.lin_out = nn.Conv1d(d_model, d_model, kernel_size=1)
+            # consider x = [x, h]
+            self.lin_out = nn.Conv1d(d_model+ d_hidden, d_model, kernel_size=1)
+        self.activation = nn.PReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.adj = None
+        self.read_out = nn.Conv1d(d_model+ d_hidden, d_out, kernel_size=1)
+        nn.init.xavier_uniform_(self.lin_in.weight)
+        nn.init.xavier_uniform_(self.lin_out.weight)
+        nn.init.xavier_uniform_(self.read_out.weight)
+
+    def forward(self, x, m, h, u, adj, cached_support=False):
+        # [batch, channels, nodes]
+        x_in = [x, m, h] if u is None else [x, m, u, h]
+        # x_in = [x, m] if u is None else [x, m, u]
+        x_in = torch.cat(x_in, 1)
+        if self.order > 1:
+            if cached_support and (self.adj is not None):
+                adj = self.adj
+            else:
+                adj = SpatialConvOrderK.compute_support_orderK(adj, self.order, include_self=False, device=x_in.device)
+                self.adj = adj if cached_support else None
+
+        x_in = self.lin_in(x_in)
+
+        out = self.graph_conv(x_in, adj)
+        if self.spatial_att is not None:
+            # [batch, channels, nodes] -> [batch, steps, nodes, features]
+            x_in = rearrange(x_in, 'b f n -> b 1 n f')
+            out_att = self.spatial_att(x_in, torch.eye(x_in.size(2), dtype=torch.bool, device=x_in.device))
+            out_att = rearrange(out_att, 'b s n f -> b f (n s)')
+            out = torch.cat([out, out_att], 1)
+        out = torch.cat([out, h], 1)
+        out = self.activation(self.lin_out(out))
+        # out = self.dropout(out)
+        # out = self.lin_out(ougit t)
+        out = torch.cat([out, h], 1)
+        # return out
+        return self.read_out(out), self.dropout(out)
