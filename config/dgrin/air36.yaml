@@ -1,0 +1,43 @@
+dataset_name: 'air36'
+window: 36
+# window: 50
+
+# window: 256
+
+adj_threshold: 0.1
+
+detrend: False
+scale: True
+scaling_axis: 'global'  # ['channels', 'global']
+scaled_target: True
+
+epochs: 300
+#samples_per_epoch: 5120  # 160 batch of 32
+batch_size: 32
+samples_per_epoch: 157
+#batch_size: 1
+aggregate_by: ['mean']
+
+model_name: 'dgrin'
+pred_loss_weight: 1
+
+#d_hidden: 64
+#d_emb: 8
+#d_ff: 64
+#ff_dropout: 0
+#kernel_size: 2
+#decoder_order: 1
+#n_layers: 1
+#layer_norm: false
+#merge: 'mlp'
+
+d_hidden: 16
+d_emb: 0
+d_ff: 16
+ff_dropout: 0
+kernel_size: 1
+decoder_order: 1
+n_layers: 1
+layer_norm: false
+merge: 'mlp'
+

@@ -1,0 +1,4 @@
+mae: nan 
+mse: nan 
+mre: 0.0000 
+mape: nan 
