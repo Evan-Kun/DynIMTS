@@ -1,11 +1,13 @@
+import numpy as np
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader, Subset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, Subset, RandomSampler, SequentialSampler, WeightedRandomSampler, ConcatDataset
 
 from .. import TemporalDataset, SpatioTemporalDataset
 from ..preprocessing import StandardScaler, MinMaxScaler
 from ...utils import ensure_list
 from ...utils.parser_utils import str_to_bool
 
+from .imbalanced_sampler import ImbalancedSampler
 
 class SpatioTemporalDataModule(pl.LightningDataModule):
     """
@@ -124,6 +126,38 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
                           batch_size=batch_size,
                           num_workers=self.workers,
                           **kwargs)
+
+        # from collections import Counter
+        #
+        # oversample = True
+        # if oversample:
+        #     for batch_idx, data in enumerate(Test):
+        # #
+        #         y = data[0]['y']
+        #         y = y[:, 0, -1, :].squeeze()
+        #         one_counts = np.count_nonzero(y)
+        #
+        #         print(f'Batch {batch_idx}: class counts=1: {one_counts}, 0: {len(y) - one_counts}')
+        # #
+        #         x = data[0]['x']
+        #         mask = data[0] ['mask']
+        #         idx_1 = np.nonzero(y)
+        #         bal_idx_1 = np.random.choice(idx_1, int(len(y)/2), replace=True)
+        #         idx_0 = (y == 0.0).nonzero()
+        #         bal_idx_0 = np.random.choice(idx_0, int(len(y)/2), replace=True)
+        #
+        #         bal_n = x[bal_idx_0,:,:,:]
+        #         bal_p = x[bal_idx_1,:,:,:]
+        #         mask_n = mask[bal_idx_0,:,:,:]
+        #         mask_p = mask[bal_idx_1,:,:,:]
+        #         x = np.vstack((bal_n, bal_p))
+        #         mask = np.vstack((mask_n, mask_p))
+        #         y[:int(len(y)/2)] = 0
+        #         y[int(len(y)/2):] = 1
+        #         one_counts = np.count_nonzero(y)
+        #
+        #         print(f'Batch {batch_idx} After oversamplling: class counts=1: {one_counts}, 0: {len(y) - one_counts}')
+
         return DataLoader(dataset,
                           shuffle=shuffle,
                           batch_size=batch_size,
@@ -133,11 +167,49 @@ class SpatioTemporalDataModule(pl.LightningDataModule):
     def train_dataloader(self, shuffle=True, batch_size=None):
         if self.samples_per_epoch is not None:
 
-            # squential samoler
+            # sequential sampler
             sampler = SequentialSampler(self.trainset)
             # sampler = RandomSampler(self.trainset, replacement=True, num_samples=self.samples_per_epoch)
             return self._data_loader(self.trainset, False, batch_size, sampler=sampler, drop_last=True)
-        shuffle = self.shuffle
+
+        # shuffle = self.shuffle
+        # imbalance = True
+        # if imbalance:
+        #     idx_0 = []
+        #     idx_1 = []
+        #     index = 0
+        #     weight = []
+        #     for sample in self.trainset:
+        #         if sample[0]['y'][0, 0, 0] == 0.0:
+        #             idx_0.append(index)
+        #             weight.append(0.0000001)
+        #         else:
+        #             idx_1.append(index)
+        #             weight.append(0.9999999)
+        #         index += 1
+            # trainset_idx_0 = self.trainset.indices[idx_0]
+            # trainset_idx_1 = self.trainset.indices[idx_1]
+            # trainset_0 = Subset(self.trainset, indices=idx_0)
+            # trainset_1 = Subset(self.trainset, indices=idx_1)
+            # iter = int(np.sqrt((len(self.trainset) / 2) / len(trainset_1)))
+            # i = 0
+            # while i < iter:
+            #     trainset_1 = np.vstack(trainset_1)
+            #     i +=1
+            # num_train_1 = len(trainset_1)
+            # num_train_0 = len(self.trainset) - num_train_1
+            # trainset_1 = np.vstack(trainset_0)
+            # indices = np.random.randint(len(trainset_1), size=len(self.trainset))
+            # new_trainset = Subset(trainset_1, indices=indices)
+            # sampler = RandomSampler(new_trainset, replacement=True, num_samples=len(self.trainset))
+            # sampler_0 = RandomSampler(trainset_0, num_samples=int(len(self.trainset) / 2))
+            # sampler_1 = RandomSampler(trainset_1, num_samples=int(len(self.trainset) - int(len(self.trainset) / 2)))
+            # merged_sampler = SequentialSampler(combined_sampler)
+            # Test_sampler = ImbalancedSampler(self.trainset)
+            # weight_sampler = WeightedRandomSampler(weights=weight, num_samples=len(self.trainset), replacement=True)
+            # return self._data_loader(self.trainset, batch_size, sampler=weight_sampler, drop_last=True)
+            # sampler = SequentialSampler(self.trainset)
+            # return self._data_loader(self.trainset, False, batch_size, sampler=sampler, drop_last=True)
         return self._data_loader(self.trainset, shuffle, batch_size, drop_last=True)
 
     def val_dataloader(self, shuffle=False, batch_size=None):
